@@ -1,36 +1,502 @@
+#!/usr/bin/env python3
+"""Run a temporary, system-wide Tor session on Debian or Ubuntu."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import math
+import os
+import pwd
+import re
+import shutil
+import signal
+import subprocess
+import sys
 import time
+from pathlib import Path
+
 import requests
-from stem import Signal
+from stem import ControllerError, Signal
 from stem.control import Controller
 
-TOR_PROXY = {
-    "http": "socks5h://127.0.0.1:9050",
-    "https": "socks5h://127.0.0.1:9050"
-}
 
-CONTROL_PORT = 9051
-TOR_PASSWORD = "YOURPASSWORD"  # use the password you set in torrc
-INTERVAL = 10  # seconds
+TOR_SOCKS_PORT = 19050
+TOR_TRANS_PORT = 19040
+TOR_DNS_PORT = 15353
+TOR_CONTROL_PORT = 19051
 
-def get_ip():
+NFT_FAMILY = "inet"
+NFT_TABLE = "tor_ip_changer_managed"
+
+APP_RUNTIME = Path("/run/ip-changer")
+SESSION_PID = APP_RUNTIME / "session.pid"
+LOCK_FILE = Path("/run/lock/ip-changer.lock")
+TOR_BASE = Path("/var/lib/tor/ip-changer")
+TOR_DATA = TOR_BASE / "data"
+TOR_CONFIG = TOR_BASE / "torrc"
+TOR_PID = TOR_BASE / "tor.pid"
+TOR_COOKIE = TOR_BASE / "control.authcookie"
+TOR_LOG = Path("/var/log/ip-changer-tor.log")
+
+
+class IpChangerError(RuntimeError):
+    pass
+
+
+def require_root() -> None:
+    if os.geteuid() != 0:
+        raise IpChangerError("Run this command with sudo.")
+
+
+def require_commands() -> None:
+    missing = [name for name in ("tor", "nft") if shutil.which(name) is None]
+    if missing:
+        raise IpChangerError(
+            f"Missing required command(s): {', '.join(missing)}. "
+            "Run sudo ./install.sh first."
+        )
+
+
+def tor_account() -> pwd.struct_passwd:
+    for name in ("debian-tor", "tor"):
+        try:
+            return pwd.getpwnam(name)
+        except KeyError:
+            pass
+    raise IpChangerError("Could not find the Tor system user. Is Tor installed?")
+
+
+def acquire_lock() -> object:
+    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    lock = LOCK_FILE.open("a+")
     try:
-        return requests.get("https://checkip.amazonaws.com", proxies=TOR_PROXY, timeout=10).text.strip()
-    except:
-        return "Error fetching IP"
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        lock.close()
+        raise IpChangerError("Another ip-changer session is already running.") from exc
+    return lock
 
-def rotate_ip(controller):
+
+def run_nft(*args: str, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["nft", *args],
+        input=input_text,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def firewall_active() -> bool:
+    return run_nft("list", "table", NFT_FAMILY, NFT_TABLE).returncode == 0
+
+
+def remove_firewall() -> bool:
+    if not firewall_active():
+        return False
+    result = run_nft("delete", "table", NFT_FAMILY, NFT_TABLE)
+    if result.returncode != 0:
+        raise IpChangerError(f"Could not remove firewall rules: {result.stderr.strip()}")
+    return True
+
+
+def firewall_rules(tor_uid: int) -> str:
+    # Local networks remain reachable. Everything else must either be redirected
+    # to this Tor instance or originate from Tor's own unprivileged account.
+    return f"""
+table {NFT_FAMILY} {NFT_TABLE} {{
+    chain output_nat {{
+        type nat hook output priority dstnat; policy accept;
+        meta skuid {tor_uid} return
+        ip daddr 127.0.0.0/8 return
+        ip6 daddr ::1 return
+        meta nfproto ipv6 return
+        udp dport 53 redirect to :{TOR_DNS_PORT}
+        ip daddr {{ 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 224.0.0.0/4 }} return
+        meta l4proto tcp redirect to :{TOR_TRANS_PORT}
+    }}
+
+    chain output_filter {{
+        type filter hook output priority filter; policy drop;
+        meta skuid {tor_uid} accept
+        oifname "lo" accept
+        ip daddr 127.0.0.1 tcp dport {TOR_TRANS_PORT} accept
+        ip daddr 127.0.0.1 udp dport {TOR_DNS_PORT} accept
+        ip daddr {{ 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 224.0.0.0/4, 255.255.255.255 }} accept
+    }}
+}}
+"""
+
+
+def install_firewall(tor_uid: int) -> None:
+    if firewall_active():
+        print("Removing stale ip-changer firewall rules...")
+        remove_firewall()
+
+    result = run_nft("-f", "-", input_text=firewall_rules(tor_uid))
+    if result.returncode != 0:
+        raise IpChangerError(f"Could not install firewall rules: {result.stderr.strip()}")
+
+
+def prepare_tor(account: pwd.struct_passwd) -> None:
+    APP_RUNTIME.mkdir(mode=0o755, parents=True, exist_ok=True)
+    TOR_BASE.mkdir(mode=0o700, parents=True, exist_ok=True)
+    TOR_DATA.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+    # Ubuntu's default Tor AppArmor profile permits Tor-owned files here.
+    for path in (TOR_BASE, TOR_DATA):
+        os.chown(path, account.pw_uid, account.pw_gid)
+        path.chmod(0o700)
+
+    config = f"""# Generated by ip-changer; removed when the session stops.
+User {account.pw_name}
+DataDirectory {TOR_DATA}
+PidFile {TOR_PID}
+SocksPort 127.0.0.1:{TOR_SOCKS_PORT}
+TransPort 127.0.0.1:{TOR_TRANS_PORT}
+DNSPort 127.0.0.1:{TOR_DNS_PORT}
+ControlPort 127.0.0.1:{TOR_CONTROL_PORT}
+CookieAuthentication 1
+CookieAuthFile {TOR_COOKIE}
+ClientOnly 1
+Log notice stdout
+"""
+    TOR_CONFIG.write_text(config, encoding="utf-8")
+    os.chown(TOR_CONFIG, account.pw_uid, account.pw_gid)
+    TOR_CONFIG.chmod(0o600)
+
+
+def log_tail(lines: int = 15) -> str:
+    try:
+        return "\n".join(TOR_LOG.read_text(encoding="utf-8", errors="replace").splitlines()[-lines:])
+    except OSError:
+        return "Tor did not produce a readable log."
+
+
+def start_tor() -> tuple[subprocess.Popen[bytes], object]:
+    log = TOR_LOG.open("ab", buffering=0)
+    process = subprocess.Popen(
+        ["tor", "-f", str(TOR_CONFIG)],
+        stdin=subprocess.DEVNULL,
+        stdout=log,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    return process, log
+
+
+def wait_for_tor(process: subprocess.Popen[bytes], timeout: int) -> Controller:
+    deadline = time.monotonic() + timeout
+    last_progress = -1
+    last_error = ""
+
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise IpChangerError(
+                f"Tor exited during startup (status {process.returncode}).\n{log_tail()}"
+            )
+
+        controller: Controller | None = None
+        try:
+            controller = Controller.from_port(address="127.0.0.1", port=TOR_CONTROL_PORT)
+            controller.authenticate()
+            phase = controller.get_info("status/bootstrap-phase")
+            match = re.search(r"PROGRESS=(\d+)", phase)
+            progress = int(match.group(1)) if match else 0
+            if progress != last_progress:
+                print(f"Tor bootstrap: {progress}%", flush=True)
+                last_progress = progress
+            if progress >= 100:
+                return controller
+            controller.close()
+        except Exception as exc:  # Control port may not exist yet.
+            last_error = str(exc)
+            if controller is not None:
+                controller.close()
+        time.sleep(1)
+
+    raise IpChangerError(
+        f"Tor did not finish bootstrapping within {timeout} seconds. {last_error}\n{log_tail()}"
+    )
+
+
+def get_ip() -> str:
+    proxies = {
+        "http": f"socks5h://127.0.0.1:{TOR_SOCKS_PORT}",
+        "https": f"socks5h://127.0.0.1:{TOR_SOCKS_PORT}",
+    }
+    try:
+        response = requests.get(
+            "https://checkip.amazonaws.com", proxies=proxies, timeout=20
+        )
+        response.raise_for_status()
+        return response.text.strip()
+    except requests.RequestException as exc:
+        return f"unavailable ({exc})"
+
+
+def request_new_identity(controller: Controller) -> None:
+    wait = math.ceil(controller.get_newnym_wait())
+    if wait > 0:
+        print(f"Tor rate limit: waiting {wait} second(s)...", flush=True)
+        time.sleep(wait)
     controller.signal(Signal.NEWNYM)
-    time.sleep(2)  # let Tor build new circuit
+    time.sleep(5)
 
-def main():
-    with Controller.from_port(port=CONTROL_PORT) as controller:
-        controller.authenticate(password=TOR_PASSWORD)
-        print("=== Tor IP Rotator Started ===\n")
+
+def process_is_ours(pid: int) -> bool:
+    try:
+        command = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ")
+    except OSError:
+        return False
+    return b"ip_changer.py" in command or b"ip-changer" in command
+
+
+def read_pid(path: Path) -> int | None:
+    try:
+        return int(path.read_text(encoding="ascii").strip())
+    except (OSError, ValueError):
+        return None
+
+
+def cleanup_tor_files() -> None:
+    for path in (TOR_CONFIG, TOR_COOKIE, TOR_PID):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def stop_stale_tor() -> bool:
+    pid = read_pid(TOR_PID)
+    if pid is None:
+        cleanup_tor_files()
+        return False
+    try:
+        command = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ")
+    except OSError:
+        cleanup_tor_files()
+        return False
+    if b"tor" not in command or b"ip-changer" not in command:
+        raise IpChangerError(f"Refusing to stop unexpected process {pid}.")
+
+    os.kill(pid, signal.SIGTERM)
+    for _ in range(50):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.1)
+    else:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    cleanup_tor_files()
+    return True
+
+
+def start_session(interval: int, bootstrap_timeout: int) -> None:
+    account = tor_account()
+    process: subprocess.Popen[bytes] | None = None
+    log = None
+    controller: Controller | None = None
+    firewall_installed = False
+
+    APP_RUNTIME.mkdir(mode=0o755, parents=True, exist_ok=True)
+    SESSION_PID.write_text(f"{os.getpid()}\n", encoding="ascii")
+
+    try:
+        # With the lock held, leftovers can only belong to an abnormally ended session.
+        if firewall_active():
+            print("Recovering firewall rules from an interrupted session...")
+            remove_firewall()
+        stop_stale_tor()
+
+        prepare_tor(account)
+        process, log = start_tor()
+        controller = wait_for_tor(process, bootstrap_timeout)
+
+        print(f"Tor exit IP: {get_ip()}")
+        install_firewall(account.pw_uid)
+        firewall_installed = True
+
+        print("\nSystem-wide Tor routing is ACTIVE.")
+        print(f"A new Tor identity will be requested every {interval} seconds.")
+        print("Press Ctrl+C to restore normal networking.\n")
+
+        next_rotation = time.monotonic() + interval
         while True:
-            rotate_ip(controller)
-            ip = get_ip()
-            print(f"\033[92mNew IP: {ip}\033[0m")
-            time.sleep(INTERVAL)
+            if process.poll() is not None:
+                raise IpChangerError(
+                    f"Tor stopped unexpectedly (status {process.returncode}).\n{log_tail()}"
+                )
+            remaining = next_rotation - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(remaining, 1))
+                continue
+
+            request_new_identity(controller)
+            print(f"New Tor exit IP: {get_ip()}", flush=True)
+            next_rotation += interval
+    except KeyboardInterrupt:
+        print("\nStopping ip-changer...")
+    finally:
+        # Restore direct networking before stopping Tor so there is no outage.
+        if firewall_installed or firewall_active():
+            try:
+                remove_firewall()
+                print("Normal networking restored.")
+            except IpChangerError as exc:
+                print(f"CRITICAL: {exc}", file=sys.stderr)
+                print("Run: sudo ip-changer restore", file=sys.stderr)
+
+        if controller is not None:
+            controller.close()
+        if process is not None and process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        if log is not None:
+            log.close()
+        cleanup_tor_files()
+        try:
+            SESSION_PID.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def restore() -> None:
+    changed = remove_firewall()
+    changed = stop_stale_tor() or changed
+    cleanup_tor_files()
+    try:
+        SESSION_PID.unlink()
+    except FileNotFoundError:
+        pass
+    print("Normal networking restored." if changed else "No ip-changer session was active.")
+
+
+def stop_session() -> None:
+    pid = read_pid(SESSION_PID)
+    if pid is None or not process_is_ours(pid):
+        print("No running session found; checking for stale rules...")
+        restore()
+        return
+    os.kill(pid, signal.SIGTERM)
+    print(f"Stop signal sent to ip-changer session {pid}.")
+
+
+def status() -> None:
+    pid = read_pid(SESSION_PID)
+    running = pid is not None and process_is_ours(pid)
+    rules = firewall_active()
+    if running and rules:
+        print(f"ACTIVE (session PID {pid}); system TCP and DNS are routed through Tor.")
+    elif running:
+        print(f"STARTING or STOPPING (session PID {pid}); firewall is not active.")
+    elif rules:
+        print("STALE firewall rules detected. Run: sudo ip-changer restore")
+    else:
+        print("INACTIVE; networking is in its normal state.")
+
+
+def new_identity() -> None:
+    if not firewall_active():
+        raise IpChangerError("No active ip-changer session was found.")
+    with Controller.from_port(address="127.0.0.1", port=TOR_CONTROL_PORT) as controller:
+        controller.authenticate()
+        request_new_identity(controller)
+    print(f"New Tor exit IP: {get_ip()}")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Temporarily route Debian/Ubuntu system traffic through Tor."
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    start = subparsers.add_parser("start", help="start a foreground Tor routing session")
+    start.add_argument(
+        "-i",
+        "--interval",
+        type=int,
+        default=180,
+        metavar="SECONDS",
+        help="seconds between NEWNYM requests (default: 180; minimum: 30)",
+    )
+    start.add_argument(
+        "--bootstrap-timeout",
+        type=int,
+        default=180,
+        metavar="SECONDS",
+        help="maximum Tor startup wait (default: 180)",
+    )
+
+    subparsers.add_parser("stop", help="stop the active session from another terminal")
+    subparsers.add_parser("restore", help="remove stale rules and restore networking")
+    subparsers.add_parser("status", help="show whether system-wide routing is active")
+    subparsers.add_parser("new-identity", help="request a new Tor circuit now")
+    return parser
+
+
+def interrupt_session(_signum: int, _frame: object) -> None:
+    # Ignore a second termination request so it cannot interrupt firewall cleanup.
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    if hasattr(signal, "SIGHUP"):
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    raise KeyboardInterrupt
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    try:
+        require_root()
+        require_commands()
+
+        if args.command == "status":
+            status()
+            return 0
+
+        lock = acquire_lock() if args.command in ("start", "restore") else None
+        try:
+            if args.command == "start":
+                if args.interval < 30:
+                    raise IpChangerError("The rotation interval must be at least 30 seconds.")
+                if args.bootstrap_timeout < 30:
+                    raise IpChangerError("The bootstrap timeout must be at least 30 seconds.")
+                previous_term = signal.signal(signal.SIGTERM, interrupt_session)
+                previous_hup = None
+                if hasattr(signal, "SIGHUP"):
+                    previous_hup = signal.signal(signal.SIGHUP, interrupt_session)
+                try:
+                    start_session(args.interval, args.bootstrap_timeout)
+                finally:
+                    signal.signal(signal.SIGTERM, previous_term)
+                    if previous_hup is not None:
+                        signal.signal(signal.SIGHUP, previous_hup)
+            elif args.command == "stop":
+                stop_session()
+            elif args.command == "restore":
+                restore()
+            elif args.command == "new-identity":
+                new_identity()
+        finally:
+            if lock is not None:
+                lock.close()
+        return 0
+    except IpChangerError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    except (OSError, ControllerError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
